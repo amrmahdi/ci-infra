@@ -20,6 +20,56 @@
 {% set hf_home_fsx = "/fsx/hf_cache" %}
 {% set list_file_diff = list_file_diff | split("|") %}
 
+{# Base image registry and cache configuration #}
+{% set private_ecr = "936637512419.dkr.ecr.us-east-1.amazonaws.com" %}
+{% set public_ecr = "public.ecr.aws/q9t5s3a7" %}
+{% set build_base_cache = private_ecr + "/vllm-build-base-cache:main" %}
+{% set build_base_private = private_ecr + "/vllm-build-base:$BUILDKITE_COMMIT" %}
+{% set build_base_public = public_ecr + "/vllm-build-base:$BUILDKITE_COMMIT" %}
+{% set build_base_latest = public_ecr + "/vllm-build-base:latest" %}
+{% set runtime_base_cache = private_ecr + "/vllm-runtime-base-cache:main" %}
+{% set runtime_base_private = private_ecr + "/vllm-runtime-base:$BUILDKITE_COMMIT" %}
+{% set runtime_base_public = public_ecr + "/vllm-runtime-base:$BUILDKITE_COMMIT" %}
+{% set runtime_base_latest = public_ecr + "/vllm-runtime-base:latest" %}
+
+{# Macro for public ECR login #}
+{% macro ecr_public_login() %}
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+{% endmacro %}
+
+{# Macro for private ECR login #}
+{% macro ecr_private_login() %}
+      - "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 936637512419.dkr.ecr.us-east-1.amazonaws.com"
+{% endmacro %}
+
+{# Macro for ECR login and docker buildx setup commands #}
+{% macro docker_buildx_setup() %}
+{{ ecr_public_login() }}
+{{ ecr_private_login() }}
+      - "docker buildx create --name vllm-builder --driver docker-container --use || true"
+      - "docker buildx inspect --bootstrap"
+{% endmacro %}
+
+{# Macro for building base images with caching and public ECR push on main #}
+{% macro build_base_image(dockerfile, cache_ref, private_tag, public_tag, latest_tag, branch) %}
+{{ docker_buildx_setup() }}
+      - >
+        docker buildx build
+        --file {{ dockerfile }}
+        --build-arg CUDA_VERSION=12.9.1
+        --build-arg PYTHON_VERSION=3.12
+        --cache-from type=registry,ref={{ cache_ref }}
+        --cache-to type=registry,ref={{ cache_ref }},mode=max,compression=zstd
+        --tag {{ private_tag }}
+        --push
+        --progress plain
+        .
+      {% if branch == "main" %}
+      - "docker buildx imagetools create --tag {{ public_tag }} {{ private_tag }}"
+      - "docker buildx imagetools create --tag {{ latest_tag }} {{ private_tag }}"
+      {% endif %}
+{% endmacro %}
+
 {% macro add_pytest_coverage(cmd, coverage_file) %}
 {% if "pytest " in cmd %}
 COVERAGE_FILE={{ coverage_file }} {{ cmd | replace("pytest ", "pytest --cov=vllm --cov-report= --cov-append --durations=0 ") }} || true
@@ -245,9 +295,41 @@ plugins:
 {% endmacro %}
 
 
+{# =============================================================================
+   Base Image Builds
+   =============================================================================
+   These steps build the base images used by the main Dockerfile:
+     - vllm-build-base: Build environment with CUDA devel, Python, PyTorch
+     - vllm-runtime-base: Runtime environment with CUDA JIT tools, FlashInfer, etc.
+
+   TODO: Add scheduled builds to periodically rebuild base images with:
+     - Latest security patches from upstream base images (nvidia/cuda, ubuntu)
+     - Updated system packages
+     - Fresh PyTorch/FlashInfer versions if pinned to ranges
+   ============================================================================= #}
+
+{# Check if base image files changed #}
+{% set base_image_files = [
+  "docker/Dockerfile.build-base",
+  "docker/Dockerfile.runtime-base",
+  "docker/build-base-image.sh",
+  "requirements/cuda.txt",
+  "requirements/common.txt",
+  "tools/install_gdrcopy.sh"
+] %}
+{% set ns_base = namespace(changed=false) %}
+{% for base_file in base_image_files %}
+  {% for diff_file in list_file_diff %}
+    {% if base_file in diff_file %}
+      {% set ns_base.changed = true %}
+    {% endif %}
+  {% endfor %}
+{% endfor %}
+
 steps:
-  - label: ":docker: build image"
-    key: image-build
+{% if ns_base.changed %}
+  - label: ":docker: Build vllm-build-base"
+    key: "build-base-image"
     depends_on: ~
     agents:
       {% if branch == "main" %}
@@ -256,11 +338,50 @@ steps:
       queue: cpu_queue_premerge_us_east_1
       {% endif %}
     commands:
-      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 936637512419.dkr.ecr.us-east-1.amazonaws.com"
-      - "docker buildx create --name vllm-builder --driver docker-container --use"
-      - "docker buildx inspect --bootstrap"
-      - "docker buildx ls"
+{{ build_base_image("docker/Dockerfile.build-base", build_base_cache, build_base_private, build_base_public, build_base_latest, branch) }}
+    retry:
+      automatic:
+        - exit_status: -1  # Agent was lost
+          limit: 2
+        - exit_status: -10  # Agent was lost
+          limit: 2
+
+  - label: ":docker: Build vllm-runtime-base"
+    key: "runtime-base-image"
+    depends_on: ~
+    agents:
+      {% if branch == "main" %}
+      queue: cpu_queue_postmerge_us_east_1
+      {% else %}
+      queue: cpu_queue_premerge_us_east_1
+      {% endif %}
+    commands:
+{{ build_base_image("docker/Dockerfile.runtime-base", runtime_base_cache, runtime_base_private, runtime_base_public, runtime_base_latest, branch) }}
+    retry:
+      automatic:
+        - exit_status: -1  # Agent was lost
+          limit: 2
+        - exit_status: -10  # Agent was lost
+          limit: 2
+{% endif %}
+
+  - label: ":docker: build image"
+    key: image-build
+{% if ns_base.changed %}
+    depends_on:
+      - "build-base-image"
+      - "runtime-base-image"
+{% else %}
+    depends_on: ~
+{% endif %}
+    agents:
+      {% if branch == "main" %}
+      queue: cpu_queue_postmerge_us_east_1
+      {% else %}
+      queue: cpu_queue_premerge_us_east_1
+      {% endif %}
+    commands:
+{{ docker_buildx_setup() }}
       - |
         #!/bin/bash
         if [[ -z $(docker manifest inspect {{ docker_image }}) ]]; then
