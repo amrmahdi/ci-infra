@@ -46,7 +46,7 @@
 {% macro docker_buildx_setup() %}
 {{ ecr_public_login() }}
 {{ ecr_private_login() }}
-      - "docker buildx create --name vllm-builder --driver docker-container --use || true"
+      - "docker buildx create --name vllm-builder --driver docker-container --use 2>/dev/null || docker buildx use vllm-builder"
       - "docker buildx inspect --bootstrap"
 {% endmacro %}
 
