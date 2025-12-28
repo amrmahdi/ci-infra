@@ -1,15 +1,41 @@
 #!/bin/bash
 set -eu -o pipefail
 
-# This script runs as ec2-user, so we need sudo for system changes
+# This script runs as ec2-user via Packer provisioner.
+# It installs BuildKit as a standalone systemd service for Docker builds.
+#
+# Why standalone buildkitd instead of docker-container driver?
+# - Cache persists reliably in /var/lib/buildkit across AMI snapshot/restore
+# - Systemd ensures buildkitd starts on boot automatically
+# - No container state to manage
 
-echo "=== Installing build tools and optimizing Docker for CI builds ==="
+echo "=== Installing BuildKit as standalone systemd service ==="
+
+# -----------------------------------------------------------------------------
+# Install BuildKit binary
+# Extract buildkitd from the official moby/buildkit image
+# -----------------------------------------------------------------------------
+echo "=== Extracting BuildKit binary from container image ==="
+
+# Pull the buildkit image
+sudo docker pull moby/buildkit:buildx-stable-1
+
+# Create a temporary container and copy out the binary
+CONTAINER_ID=$(sudo docker create moby/buildkit:buildx-stable-1)
+sudo docker cp "$CONTAINER_ID:/usr/bin/buildkitd" /usr/local/bin/buildkitd
+sudo docker rm "$CONTAINER_ID"
+
+sudo chmod +x /usr/local/bin/buildkitd
+echo "BuildKit binary installed:"
+/usr/local/bin/buildkitd --version
 
 # -----------------------------------------------------------------------------
 # Create BuildKit daemon configuration
 # -----------------------------------------------------------------------------
 echo "=== Creating BuildKit configuration ==="
 sudo mkdir -p /etc/buildkit
+sudo mkdir -p /var/lib/buildkit
+
 cat <<'EOF' | sudo tee /etc/buildkit/buildkitd.toml
 # BuildKit daemon configuration for vLLM CI builds
 #
@@ -26,78 +52,110 @@ cat <<'EOF' | sudo tee /etc/buildkit/buildkitd.toml
 
 EOF
 
-# -----------------------------------------------------------------------------
-# Create the baked builder
-#
-# NOTE: Prefixed with "baked-" to avoid conflict with CI's "vllm-builder".
-#
-# Cache persistence strategy (from Docker docs):
-# - docker-container driver automatically creates a Docker volume for cache
-# - Volume name: buildx_buildkit_<builder-name>0_state
-# - This volume is stored in /var/lib/docker/volumes/ (part of EBS snapshot)
-#
-# After AMI snapshot/restore:
-# - The volume persists (it's on the EBS volume)
-# - The container is set to restart=always, so it starts automatically
-# - If the container is deleted, CI can recreate the builder with the same
-#   name to inherit the existing volume and cached state
-# -----------------------------------------------------------------------------
-echo "=== Creating baked builder ==="
-
-# network=host: Avoids Docker network overhead, enables direct ECR/registry access
-sudo docker buildx create \
-  --name baked-vllm-builder \
-  --driver docker-container \
-  --driver-opt network=host \
-  --config /etc/buildkit/buildkitd.toml \
-  --use \
-  --bootstrap
-
-# Show the created volume
-echo "=== BuildKit state volume created ==="
-sudo docker volume ls | grep buildkit || true
+echo "BuildKit configuration created at /etc/buildkit/buildkitd.toml"
 
 # -----------------------------------------------------------------------------
-# Configure the builder container to restart on boot
+# Create systemd service for BuildKit daemon
 # -----------------------------------------------------------------------------
-echo "=== Configuring builder to restart on boot ==="
+echo "=== Creating BuildKit systemd service ==="
 
-# Wait for container to be fully running
-sleep 3
+cat <<'EOF' | sudo tee /etc/systemd/system/buildkitd.service
+[Unit]
+Description=BuildKit daemon for Docker builds
+After=network.target docker.service
 
-# Dynamically get the builder container name (don't hardcode it)
-BUILDER_CONTAINER=$(sudo docker ps --filter "name=buildx_buildkit_baked-vllm-builder" --format "{{.Names}}" | head -1)
+[Service]
+Type=simple
+# --group docker: socket owned by docker group, accessible to buildkite-agent (who is in docker group)
+ExecStart=/usr/local/bin/buildkitd --config /etc/buildkit/buildkitd.toml --root /var/lib/buildkit --group docker
+Restart=always
+RestartSec=5
 
-if [[ -n "${BUILDER_CONTAINER}" ]]; then
-  sudo docker update --restart=always "${BUILDER_CONTAINER}"
-  echo "=== Builder container '${BUILDER_CONTAINER}' configured with restart=always ==="
+# Prevent OOM killer from targeting buildkitd
+OOMScoreAdjust=-500
+
+# No timeout for long-running builds
+TimeoutStartSec=0
+TimeoutStopSec=300
+
+# Increase file descriptor limits
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo chmod 644 /etc/systemd/system/buildkitd.service
+sudo systemctl daemon-reload
+sudo systemctl enable buildkitd.service
+
+echo "=== Starting BuildKit daemon ==="
+sudo systemctl start buildkitd.service
+
+# Wait for daemon to start (up to 30 seconds)
+echo "Waiting for buildkitd to start..."
+for i in {1..30}; do
+  if sudo systemctl is-active --quiet buildkitd.service; then
+    echo "✅ BuildKit daemon is running"
+    sudo systemctl status buildkitd.service --no-pager
+    break
+  fi
+  if [[ $i -eq 30 ]]; then
+    echo "❌ BuildKit daemon failed to start"
+    sudo journalctl -u buildkitd.service --no-pager -n 50
+    exit 1
+  fi
+  sleep 1
+done
+
+# Verify socket is available and accessible
+if [[ -S /run/buildkit/buildkitd.sock ]]; then
+  echo "✅ BuildKit socket available at /run/buildkit/buildkitd.sock"
+  ls -la /run/buildkit/
 else
-  echo "ERROR: Builder container not found"
-  sudo docker ps -a | grep buildkit || true
+  echo "❌ BuildKit socket not found"
+  sudo ls -la /run/buildkit/ || echo "Directory /run/buildkit doesn't exist"
   exit 1
 fi
 
-# Get the state volume name
-STATE_VOLUME=$(sudo docker volume ls --format "{{.Name}}" | grep "buildx_buildkit_baked-vllm-builder" | head -1)
+# -----------------------------------------------------------------------------
+# Install systemd service to create buildx config on boot
+# The buildx client config (~/.docker/buildx/) doesn't persist across AMI
+# snapshot/restore, so we recreate it on boot using this service.
+# -----------------------------------------------------------------------------
+echo "=== Installing buildx-builder systemd service ==="
+sudo cp /tmp/scripts/buildx-builder.service /etc/systemd/system/buildx-builder.service
+sudo chmod 644 /etc/systemd/system/buildx-builder.service
+sudo systemctl daemon-reload
+sudo systemctl enable buildx-builder.service
 
-if [[ -z "${STATE_VOLUME}" ]]; then
-  echo "ERROR: BuildKit state volume not found"
-  sudo docker volume ls
-  exit 1
-fi
+# Test the service by actually starting it via systemd
+# This catches systemd configuration issues before AMI creation
+echo "=== Testing buildx-builder.service ==="
+sudo systemctl start buildx-builder.service
 
-# Verify setup
-echo "=== BuildKit setup complete ==="
-sudo docker buildx ls
-sudo docker ps --filter "name=buildkit" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
-sudo docker volume ls | grep buildkit
+# Wait for service to complete (up to 10 seconds)
+for i in {1..10}; do
+  if sudo systemctl is-active --quiet buildx-builder.service; then
+    echo "✅ buildx-builder.service started successfully"
+    # Verify the builder was created
+    if sudo -u buildkite-agent HOME=/var/lib/buildkite-agent docker buildx ls | grep -q baked-vllm-builder; then
+      echo "✅ baked-vllm-builder is configured"
+      sudo -u buildkite-agent HOME=/var/lib/buildkite-agent docker buildx ls
+      break
+    else
+      echo "❌ baked-vllm-builder not found in docker buildx ls"
+      sudo -u buildkite-agent HOME=/var/lib/buildkite-agent docker buildx ls
+      exit 1
+    fi
+  fi
+  if [[ $i -eq 10 ]]; then
+    echo "❌ buildx-builder.service failed to start"
+    sudo systemctl status buildx-builder.service --no-pager
+    sudo journalctl -u buildx-builder.service --no-pager -n 50
+    exit 1
+  fi
+  sleep 1
+done
 
-echo ""
-echo "=== Configuration summary ==="
-echo "BuildKit config: /etc/buildkit/buildkitd.toml"
-echo "Builder name: baked-vllm-builder"
-echo "Builder container: ${BUILDER_CONTAINER:-not found}"
-echo "State volume: ${STATE_VOLUME:-not found}"
-echo ""
-echo "CI can recreate builder with same name to inherit cache:"
-echo "  docker buildx create --name baked-vllm-builder --driver docker-container --config /etc/buildkit/buildkitd.toml --use --bootstrap"
+echo "=== BuildKit installation complete ==="
