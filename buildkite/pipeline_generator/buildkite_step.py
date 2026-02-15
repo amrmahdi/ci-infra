@@ -253,19 +253,9 @@ def convert_group_step_to_buildkite_step(
 
 def _step_should_run(step: Step, list_file_diff: List[str]) -> bool:
     global_config = get_global_config()
+    # TEMPORARY: Only run image-build steps for cache testing
     if step.key and step.key.startswith("image-build"):
         return True
-    if global_config["nightly"] == "1":
-        return True
-    if step.optional:
-        return False
-    if global_config["run_all"]:
-        return True
-    if step.source_file_dependencies:
-        for source_file in step.source_file_dependencies:
-            for diff_file in list_file_diff:
-                if source_file in diff_file:
-                    return True
     return False
 
 
